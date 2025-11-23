@@ -1,0 +1,10 @@
+# Ambientes e Segredos
+.env
+__pycache__/
+*.pyc
+.DS_Store
+
+# Diretórios de dados do Docker (se estiverem na pasta local)
+mongo_data/
+minio_data/
+grafana_data/

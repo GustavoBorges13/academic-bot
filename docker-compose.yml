@@ -1,0 +1,170 @@
+version: '3.8'
+
+networks:
+  academic_net:
+    driver: bridge
+
+services:
+  # ==========================================
+  #       BROKER (MENSAGERIA)
+  # ==========================================
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: academic_rabbit
+    restart: always
+    # Segurança: Bind apenas em localhost. 
+    # O tunnel ou SSH acessa, a internet direta não.
+    ports:
+      - "127.0.0.1:5672:5672"   
+      - "127.0.0.1:15672:15672" 
+    env_file: .env
+    networks:
+      - academic_net
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  #       BANCO DE DADOS
+  # ==========================================
+  mongo:
+    image: mongo:latest
+    container_name: academic_mongo
+    restart: always
+    # Segurança: NENHUMA porta exposta. 
+    # A API e o Worker acessam via rede interna 'academic_net'.
+    env_file: .env
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - academic_net
+
+  mongo-express:
+    image: mongo-express
+    container_name: academic_mongo_gui
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      # Conexão com o banco (Seguro via .env)
+      ME_CONFIG_MONGODB_URL: ${MONGO_URI_GUI}
+      
+      # Login da interface Web (Seguro via .env)
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USER}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASS}
+    depends_on:
+      - mongo
+    networks:
+      - academic_net
+
+  # ==========================================
+  #       OBJECT STORAGE (MINIO/S3)
+  # ==========================================
+  minio:
+    image: minio/minio
+    container_name: academic_minio
+    ports:
+      - "127.0.0.1:9000:9000" # API S3 Local
+      - "127.0.0.1:9001:9001" # Console Web Local
+    env_file: .env
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - academic_net
+
+  # ==========================================
+  #       OBSERVABILIDADE
+  # ==========================================
+  prometheus:
+    image: prom/prometheus
+    container_name: academic_prometheus
+    # Segurança: Sem portas. O Grafana acessa ele internamente.
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - academic_net
+
+  grafana:
+    image: grafana/grafana
+    container_name: academic_grafana
+    ports:
+      - "127.0.0.1:3000:3000" # Acesso seguro via localhost
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - academic_net
+
+  # ==========================================
+  #       SUA APLICAÇÃO
+  # ==========================================
+  api: # MASTER
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+    container_name: academic_api
+    # O Cloudflare Tunnel vai apontar para localhost:8000
+    command: uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file: .env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+    networks:
+      - academic_net
+
+  worker: # WORKER
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+    container_name: academic_worker
+    command: python -u -m src.worker
+    # Segurança: Sem portas. O Prometheus lê metrics via rede interna na porta 8001.
+    env_file: .env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mongo:
+        condition: service_started
+    networks:
+      - academic_net
+
+  notifier: # NOVO SERVIÇO
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+    container_name: academic_notifier
+    command: python -u -m src.notifier
+    restart: always
+    env_file: .env
+    depends_on:
+      mongo:
+        condition: service_started
+    networks:
+      - academic_net
+
+  discord_bot:
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+    container_name: academic_discord
+    command: python -u -m src.discord_bot
+    restart: always
+    env_file: .env
+    depends_on:
+      mongo:
+        condition: service_started
+    networks:
+      - academic_net
+
+volumes:
+  mongo_data:
+  minio_data:
+  grafana_data:
