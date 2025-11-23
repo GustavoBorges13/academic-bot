@@ -11,7 +11,7 @@
 
 [![Telegram](https://img.shields.io/badge/Telegram-Iniciar_Bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/GustavosArchBotdo )
 [![Discord](https://img.shields.io/badge/Discord-Adicionar_ao_Servidor-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/oauth2/authorize?client_id=1442108465546788884)
-
+[![Falar com o Bot](https://img.shields.io/badge/Discord-DM_Direta-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/users/1442129543589658678)
 </div>
 
 
