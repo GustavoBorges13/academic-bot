@@ -1,22 +1,90 @@
 # --- START OF FILE src/utils.py ---
 import re
 import shlex
-from datetime import datetime
+import secrets
+import string
+from datetime import datetime, timedelta
+from src.database import db
+
+# =========================================
+#       UTILITÁRIOS GERAIS
+# =========================================
+
+def generate_link_code(platform, user_id):
+    alphabet = string.ascii_uppercase + string.digits
+    token = ''.join(secrets.choice(alphabet) for i in range(6))
+    db.pending_links.insert_one({
+        "token": token, "platform": platform, "user_id": user_id,
+        "created_at": datetime.utcnow()
+    })
+    return token
+
+def validate_link_code(token, target_platform, target_user_id):
+    record = db.pending_links.find_one({"token": token})
+    if not record: return False, "⛔ Código inválido ou expirado."
+    if record['platform'] == target_platform: return False, "⚠️ Use a outra plataforma."
+    
+    source_id = record['user_id']
+    current_linked = get_linked_ids(target_user_id)
+    if source_id in current_linked:
+        db.pending_links.delete_one({"_id": record["_id"]})
+        return False, "⚠️ **Já conectados!**"
+
+    config = db.user_settings.find_one({"$or": [{"user_id": source_id}, {"aliases": source_id}, {"user_id": target_user_id}, {"aliases": target_user_id}]})
+    if not config: db.user_settings.insert_one({"user_id": source_id, "aliases": [target_user_id]})
+    else: db.user_settings.update_one({"_id": config["_id"]}, {"$addToSet": {"aliases": {"$each": [source_id, target_user_id]}}})
+        
+    db.pending_links.delete_one({"_id": record["_id"]})
+    return True, "✅ **Contas Vinculadas!**"
+
+def get_linked_ids(user_id):
+    config = db.user_settings.find_one({"$or": [{"user_id": user_id}, {"aliases": user_id}]})
+    ids = {user_id}
+    if config:
+        if "user_id" in config: ids.add(config["user_id"])
+        if "aliases" in config: ids.update(config["aliases"])
+    return list(ids)
+
+def unlink_account(requester_id):
+    linked_ids = get_linked_ids(requester_id)
+    if len(linked_ids) <= 1: return False, "⚠️ Nenhuma conta vinculada."
+    db.user_settings.update_many({"aliases": requester_id}, {"$pull": {"aliases": requester_id}})
+    db.user_settings.update_one({"user_id": requester_id}, {"$set": {"aliases": []}})
+    return True, "✅ Desvinculado com sucesso."
+
+def unlink_specific(requester_id, target_id_to_remove):
+    try: target_id_to_remove = int(target_id_to_remove)
+    except: pass
+    linked_ids = get_linked_ids(requester_id)
+    if target_id_to_remove not in linked_ids: return False, "🚫 ID não vinculado."
+    db.user_settings.update_many({"$or": [{"user_id": requester_id}, {"aliases": requester_id}]}, {"$pull": {"aliases": target_id_to_remove}})
+    db.user_settings.update_many({"user_id": target_id_to_remove}, {"$pull": {"aliases": requester_id}})
+    return True, f"✅ Vínculo com `{target_id_to_remove}` removido."
+
+def get_partners(user_id):
+    return [uid for uid in get_linked_ids(user_id) if uid != user_id]
+
+def singularize(text):
+    text = text.strip()
+    if text.lower() in ["tcc", "atps", "quiz"]: return text 
+    if text.endswith("es"): return text[:-2]
+    if text.endswith("s"): return text[:-1]
+    return text
+
+# =========================================
+#       PARSERS DE DATA E TEMPO
+# =========================================
 
 def parse_time_string(text):
-    """Converte '1h 30m', '2s' para segundos."""
     if not text: return None
     text = text.lower().strip()
     multipliers = {'s': 1, 'seg': 1, 'min': 60, 'h': 3600, 'd': 86400, 'w': 604800, 'm': 2592000}
     pattern = r'(\d+)\s*(min|seg|s|h|d|w|m)'
     matches = re.findall(pattern, text)
-    
     if not matches: return None
-        
     total = 0
     for valor, unidade in matches:
-        if unidade in multipliers:
-            total += int(valor) * multipliers[unidade]
+        if unidade in multipliers: total += int(valor) * multipliers[unidade]
     return total
 
 def format_seconds(seconds):
@@ -26,66 +94,35 @@ def format_seconds(seconds):
     return f"{seconds//86400}d"
 
 def parse_smart_date(date_str):
-    """Converte '10/12', '10-12-2025' -> datetime object."""
     if not date_str: return None
-    
-    # 1. Normaliza separadores (troca - ou . por /)
     date_str = date_str.replace('-', '/').replace('.', '/')
-    
-    # 2. Remove qualquer coisa que NÃO seja número ou barra (ex: aspas extras)
     clean_str = re.sub(r'[^\d/]', '', date_str)
-    
     try:
-        # Tenta formatos com a string limpa
         for fmt in ["%d/%m/%Y", "%Y/%m/%d", "%d/%m"]:
             try:
                 d = datetime.strptime(clean_str, fmt)
-                
-                # Lógica para data sem ano (dd/mm)
                 if fmt == "%d/%m":
                     now = datetime.now()
                     d = d.replace(year=now.year)
-                    # Se a data já passou este ano, joga pro ano que vem
-                    if d.date() < now.date():
-                        d = d.replace(year=now.year + 1)
-                
+                    if d.date() < now.date(): d = d.replace(year=now.year + 1)
                 return d.replace(hour=8, minute=0, second=0)
             except: pass
-            
-        # Fallback manual (caso o strptime falhe)
         parts = clean_str.split('/')
         if len(parts) < 2: return None
-
         now = datetime.now()
         day, month = int(parts[0]), int(parts[1])
-        
-        # Se tiver 3 partes, usa o ano fornecido. Se tiver 2, usa lógica smart.
-        if len(parts) == 3:
-            year = int(parts[2])
-        else:
-            year = now.year
-            
-        # Corrige ano com 2 dígitos (ex: 26 vira 2026)
+        year = int(parts[2]) if len(parts) == 3 else now.year
         if year < 100: year += 2000
-        
         d_obj = datetime(year, month, day, 8, 0, 0)
-        
-        # Se for sem ano e já passou, +1 ano
-        if len(parts) == 2 and d_obj.date() < now.date():
-             d_obj = d_obj.replace(year=year + 1)
-             
+        if len(parts) == 2 and d_obj.date() < now.date(): d_obj = d_obj.replace(year=year + 1)
         return d_obj
-    except:
-        return None
+    except: return None
 
 def parse_cli_args(text):
-    """Separa argumentos e flags (-alta, -obs). Suporta aspas."""
     try: tokens = shlex.split(text)
     except: tokens = text.split()
-
     args = []
     flags = {"prio": None, "obs": ""}
-    
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -100,11 +137,15 @@ def parse_cli_args(text):
         elif token.startswith("-"): pass
         else: args.append(token)
         i += 1
-        
     return args, flags
 
+# =========================================
+#       GERADOR DE ÁRVORE (DUAL STYLE)
+# =========================================
 
-def generate_ascii_tree(tasks, mode='smart'):
+# --- Em src/utils.py ---
+
+def generate_ascii_tree(tasks, mode='smart', style='diff'):
     if not tasks: return "📭 *Lista vazia!*"
     
     now = datetime.now()
@@ -117,70 +158,109 @@ def generate_ascii_tree(tasks, mode='smart'):
         if p['materia'] not in dados[tipo]: dados[tipo][p['materia']] = []
         dados[tipo][p['materia']].append(p)
 
-    lines = ["🌲 *Visão Geral*", "```diff"]
+    lines = []
+    
+    # --- CONFIGURAÇÃO DE ESTILO ---
+    if style == 'ansi':
+        ESC = "\u001b["
+        RESET = f"{ESC}0m"
+        
+        # CORES ATUALIZADAS
+        COR_TITULO    = f"{ESC}1;37m" # BRANCO (Categorias)
+        COR_TAG_TEXT  = f"{ESC}1;37m" # BRANCO (Flags [URG])
+        
+        COR_ESTRUTURA = f"{ESC}0;34m" # Azul Escuro (Árvore)
+        COR_MATERIA   = f"{ESC}1;35m" # Roxo (Eventos)
+        
+        COR_URGENTE   = f"{ESC}1;31m" # Vermelho (Para a DATA)
+        COR_MEDIO     = f"{ESC}1;33m" # Amarelo (Para a DATA)
+        COR_BAIXO     = f"{ESC}0;34m" # Azul (Para a DATA e Obs)
+        
+        lines.append("```ansi")
+    else:
+        # Telegram (Diff)
+        lines.append("🌲 *Visão Geral*")
+        lines.append("```diff")
     
     tipos = sorted(dados.keys())
+    priority = ["Provas", "Trabalhos"]
+    tipos = priority + [x for x in tipos if x not in priority]
+    tipos = [t for t in tipos if t in dados]
+
     for tipo in tipos:
-        lines.append(f"+ : : {tipo.upper()} : :")
+        if style == 'ansi':
+            lines.append(f"\n{COR_TITULO}: : {tipo.upper()} : :{RESET}")
+        else:
+            lines.append(f"+ : : {tipo.upper()} : :")
         
         materias = sorted(dados[tipo].keys())
         for j, materia in enumerate(materias):
-            prefix = "└──" if j == len(materias)-1 else "├──"
+            is_last_mat = (j == len(materias)-1)
+            prefix = "└──" if is_last_mat else "├──"
             
-            # MUDANÇA 1: Colocamos '#' na Matéria para ela ficar Cinza
-            # # + 2 espaços = 3 caracteres. Alinha com os filhos.
-            lines.append(f"#  {prefix} {materia}")
+            if style == 'ansi':
+                # Estrutura Azul, Matéria Roxa
+                lines.append(f"{COR_ESTRUTURA}{prefix} {RESET}{COR_MATERIA}{materia}{RESET}")
+            else:
+                lines.append(f"#  {prefix} {materia}")
             
             docs = sorted(dados[tipo][materia], key=lambda x: parse_smart_date(x['data']) or datetime.max)
-            
-            indent = "    " if prefix == "└──" else "│   "
+            indent = "    " if is_last_mat else "│   "
             
             for k, d in enumerate(docs):
                 conn = "└──" if k == len(docs)-1 else "├──"
-                
                 dt_obj = parse_smart_date(d['data'])
                 delta_days = (dt_obj - today).days if dt_obj else 999
                 prio = d.get('prioridade', 'low')
                 
+                tag = "[LOW]"
                 if prio == 'critical': tag = "[URG]"
                 elif prio == 'medium': tag = "[MED]"
-                else: tag = "[LOW]"
                 
                 obs = d.get('observacoes', '')
-                obs_str = f"{obs} " if obs else ""
+                obs_str = f"({obs}) " if obs else ""
                 
-                content = f"{conn} {obs_str}{d['data']} {tag}"
-
-                # --- DECISÃO DE COR ---
-                color_type = "none" # Padrão agora é SEM COR (Branco/Normal)
-                
-                if delta_days < 0:
-                    color_type = "gray" # Passado continua Cinza (opcional)
-                else:
-                    if mode == 'manual':
-                        if prio == 'critical': color_type = "red"
-                        elif prio == 'medium': color_type = "orange"
-                        else: color_type = "none" # Baixa manual = Sem cor
-                    else: # Smart
-                        if prio == 'critical' or delta_days <= 7: color_type = "red"
-                        elif prio == 'medium' or delta_days <= 30: color_type = "orange"
-                        else: color_type = "none" # Seguro smart = Sem cor
-
-                # --- MONTAGEM VISUAL ---
-                
-                if color_type == "orange":
-                    # Laranja (Aspas) -> '  │   └── ...'
-                    lines.append(f"'  {indent}{content}'")
+                if style == 'ansi':
+                    # Lógica de Cor para a DATA (Smart)
+                    date_color = COR_BAIXO # Padrão Azul
                     
-                elif color_type == "none":
-                    # Sem cor (Espaços) -> '   │   └── ...'
-                    # 3 espaços para alinhar com o '#  ' ou '-  '
-                    lines.append(f"   {indent}{content}")
+                    if delta_days < 0 or prio == 'critical': 
+                        date_color = COR_URGENTE
+                    elif mode == 'smart' and delta_days <= 7:
+                        date_color = COR_URGENTE
+                    elif prio == 'medium' or (mode == 'smart' and delta_days <= 30):
+                        date_color = COR_MEDIO
                     
+                    # MONTAGEM DA LINHA (Obs -> Data -> Tag)
+                    # Obs: Azul
+                    # Data: Colorida (Vermelho/Amarelo/Azul)
+                    # Tag: Branca
+                    
+                    str_line = (
+                        f"{COR_ESTRUTURA}{indent}{conn} {RESET}"
+                        f"{COR_BAIXO}{obs_str}{RESET}"
+                        f"{date_color}{d['data']}{RESET} "
+                        f"{COR_TAG_TEXT}{tag}{RESET}"
+                    )
+                    lines.append(str_line)
+                
                 else:
-                    # Símbolos (- ou #) -> '-  │   └── ...'
-                    sym = "-" if color_type == "red" else "#"
-                    lines.append(f"{sym}  {indent}{content}")
+                    # Lógica Diff (Telegram) - Mantém estrutura padrão pois Diff não suporta cores livres
+                    content = f"{conn} {obs_str}{d['data']} {tag}"
+                    color_type = "none"
+                    if delta_days < 0: color_type = "gray"
+                    else:
+                        if mode == 'manual':
+                            if prio == 'critical': color_type = "red"
+                            elif prio == 'medium': color_type = "orange"
+                        else:
+                            if prio == 'critical' or delta_days <= 7: color_type = "red"
+                            elif prio == 'medium' or delta_days <= 30: color_type = "orange"
+
+                    if color_type == "orange": lines.append(f"'  {indent}{content}'")
+                    elif color_type == "red": lines.append(f"-  {indent}{content}")
+                    elif color_type == "gray": lines.append(f"-  {indent}{content}")
+                    else: lines.append(f"   {indent}{content}")
 
     lines.append("```")
     return "\n".join(lines)

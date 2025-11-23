@@ -13,8 +13,12 @@ from bson import ObjectId
 from prometheus_client import start_http_server, Counter, Histogram
 from src.config import Config
 from src.database import db
-from src.utils import parse_time_string, format_seconds, parse_smart_date, parse_cli_args, generate_ascii_tree
-
+from src.utils import (
+    parse_time_string, format_seconds, parse_smart_date, 
+    parse_cli_args, generate_ascii_tree, singularize, 
+    generate_link_code, validate_link_code, get_linked_ids, 
+    unlink_account, get_partners, unlink_specific
+)
 # --- MÉTRICAS ---
 TASKS = Counter('academic_tasks_total', 'Total Tarefas', ['action'])
 LATENCY = Histogram('task_processing_seconds', 'Tempo Processamento')
@@ -143,7 +147,10 @@ def gerar_painel(user_id, provas, layout_override=None):
 
 def listar_agenda(chat_id, msg_id=None):
     # Busca provas para gerar o TEXTO visual (Arvore/Painel)
-    provas = list(db.provas.find({"user_id": chat_id}).sort("data", 1))
+    # Pega lista de IDs vinculados
+    ids = get_linked_ids(chat_id)
+    # Busca provas de todos eles
+    provas = list(db.provas.find({"user_id": {"$in": ids}}).sort("data", 1))
     texto = gerar_painel(chat_id, provas)
     
     kb = {"inline_keyboard": []}
@@ -284,8 +291,12 @@ def enviar_ajuda(chat_id, eh_erro=False, msg_id=None):
         "`tree v` ou `tree f` _(mostra arvore vertical)_\n"
         "`tree notify` _(mostra arvore formatada pra notificao colorida)_\n"
         "`alert -help` _(notificações comandos)_\n"
-        "`export` _(faz backup em arquivo JSON e disponibiliza p/ download)_\n"
-        "`menu` _(abre menu)_"
+        "`export` _(faz backup em arquivo JSON e disponibiliza p/ download e libera API p/ uso)_\n"
+        "`import` _(importar arquivo .json, valida, e atualiza o banco de dados)_\n"
+        "`menu` _(abre menu)_\n\n"
+
+        "🧩*INTEGRAÇÃO:*\n"
+        "`link` _(mostra instruções para vincular conta com discord. Copiar dados telegram > discord)_"
     )
     kb = {"inline_keyboard": [[{"text": "🔙 Voltar ao Menu", "callback_data": "menu"}]]}
     send_tg(chat_id, texto, kb, msg_id)
@@ -605,6 +616,32 @@ def processar_texto(chat_id, text, msg_id):
 
     # --- COMANDO ALERT REFINADO ---
     elif cmd == "alert":
+        # --- ADICIONE ESTE BLOCO NO INÍCIO DO IF ALERT ---
+        if "test" in body.lower():
+            # 1. Pega configurações
+            cfg = db.user_settings.find_one({"user_id": chat_id}) or {}
+            mode = cfg.get("notify_mode", "smart")
+            
+            # 2. Busca tarefas
+            all_tasks = list(db.provas.find({"user_id": chat_id}).sort("data", 1))
+            
+            if not all_tasks:
+                send_tg(chat_id, "📭 Sem eventos para testar.")
+                return
+
+            # 3. Gera mensagem simulando o Worker
+            lines = [f"🔔 *Teste de Notificação ({mode.title()})*", ""]
+            
+            # (Opcional) Aqui você poderia repetir a lógica de filtro do notifier.py
+            # Mas para simplificar o teste visual, vamos mandar a Árvore Colorida direto
+            
+            lines.append("_Visualização da Árvore de Alerta:_")
+            lines.append(generate_ascii_tree(all_tasks, mode=mode))
+            
+            send_tg(chat_id, "\n".join(lines))
+            return
+        # -------------------------------------------------
+
         if "desativar" in body.lower():
             db.user_settings.update_one({"user_id": chat_id}, {"$unset": {"periodic_interval": ""}})
             send_tg(chat_id, "🔕 Alertas desativados.")
@@ -760,6 +797,93 @@ def processar_texto(chat_id, text, msg_id):
             send_tg(chat_id, "❌ Erro ao enviar arquivo.")
             print(f"Erro export: {e}")
 
+    elif cmd == "import":
+        set_state(chat_id, "import_wait", "wait_file")
+        msg = (
+            "📥 *Importar Backup (.json)*\n\n"
+            "Envie agora o arquivo `.json` gerado anteriormente pelo comando `/export`.\n"
+            "⚠️ _Isso irá adicionar os eventos do arquivo à sua agenda atual._"
+        )
+        kb = {"inline_keyboard": [[{"text": "❌ Cancelar", "callback_data": "menu"}]]}
+        send_tg(chat_id, msg, kb)
+            
+    elif cmd == "link":
+        partners = get_partners(chat_id) # Pega lista de parceiros
+        
+        # A. STATUS (NOVO)
+        if body.lower() == "status":
+            if not partners:
+                send_tg(chat_id, "🔓 **Status:** Conta Isolada (Sem vínculos).")
+            else:
+                lines = ["🔗 **Contas Vinculadas:**"]
+                for p in partners:
+                    lines.append(f"• ID: `{p}`")
+                lines.append("\nPara remover uma específica, use:\n`/link desvincular ID`")
+                send_tg(chat_id, "\n".join(lines))
+            return
+
+        # B. DESVINCULAR (ATUALIZADO)
+        if "desvincular" in body.lower():
+            parts = body.split()
+            # Se o usuário digitou: /link desvincular 123456
+            if len(parts) > 1 and parts[1].isdigit():
+                target_id = parts[1]
+                success, msg = unlink_specific(chat_id, target_id)
+                send_tg(chat_id, msg)
+            else:
+                # Desvincular TUDO (Sair do grupo)
+                msg = (
+                    "⚠️ *Gerenciar Vínculos*\n\n"
+                    f"Você possui {len(partners)} conexões.\n\n"
+                    "1️⃣ Para remover **apenas uma conta**, digite:\n"
+                    "`/link desvincular ID_DA_CONTA`\n"
+                    "(Veja o ID usando `/link status`)\n\n"
+                    "2️⃣ Para **sair de tudo** (desvincular-se totalmente):"
+                )
+                kb = {"inline_keyboard": [
+                    [{"text": "🚫 Sair de TODAS as contas", "callback_data": "do_unlink_confirm"}],
+                    [{"text": "🔙 Cancelar", "callback_data": "menu"}]
+                ]}
+                send_tg(chat_id, msg, kb)
+            return
+
+        # C. GERAR CÓDIGO (DISCORD)
+        if body.lower() == "discord":
+            # Verifica se já tem contas (aviso amigável)
+            aviso_extra = ""
+            if len(partners) > 0:
+                aviso_extra = f"\n⚠️ _Nota: Você já tem {len(partners)} conta(s) vinculada(s). Este novo vínculo será adicionado ao grupo existente._"
+
+            token = generate_link_code("telegram", chat_id)
+            msg = (
+                f"🔐 *Código de Vínculo Gerado*\n"
+                f"`{token}`\n\n"
+                f"1. Copie este código.\n"
+                f"2. Vá no seu Bot do **Discord**.\n"
+                f"3. Digite: `!link {token}`\n"
+                f"_Válido por 5 minutos._"
+                f"{aviso_extra}"
+            )
+            send_tg(chat_id, msg)
+        
+        # D. ENTRAR COM CÓDIGO (VALIDAÇÃO)
+        elif body and body.lower() not in ["discord", "status", "desvincular"]:
+            # Verifica se já tem contas antes (opcional, só info visual)
+            token = body.strip()
+            success, resp = validate_link_code(token, "telegram", chat_id)
+            send_tg(chat_id, resp)
+            
+        # E. MENU AJUDA DO LINK
+        else:
+            msg = (
+                "🔗 *Central de Vínculos*\n\n"
+                "`/link discord` - Gerar código p/ conectar no Discord\n"
+                "`/link status` - Ver contas conectadas\n"
+                "`/link CÓDIGO` - Colar código vindo do Discord\n"
+                "`/link desvincular` - Opções de remoção"
+            )
+            send_tg(chat_id, msg)
+
     elif cmd in ["start", "menu", "cancel"]:
         clear_state(chat_id)
         listar_agenda(chat_id)
@@ -769,6 +893,78 @@ def processar_texto(chat_id, text, msg_id):
         # Nova resposta curta para comandos errados
         send_tg(chat_id, "⚠️ *Comando ou sintaxe inválida!*\nUse o menu \"❓ Ajuda\" ou digite `/ajuda` / `/help`")
 
+
+def processar_documento(chat_id, document, caption, msg_id):
+    # Verifica se estava aguardando importação
+    state = get_state(chat_id)
+    if not state or state.get('mode') != 'import_wait':
+        send_tg(chat_id, "⚠️ Para importar um backup, digite `/import` primeiro.", msg_id=msg_id)
+        return
+
+    if not document.get("file_name", "").endswith(".json"):
+        send_tg(chat_id, "🚫 Formato inválido. Envie um arquivo **.json**.", msg_id=msg_id)
+        return
+
+    send_tg(chat_id, "⏳ Lendo arquivo...")
+
+    try:
+        # 1. Baixar e Ler
+        file_id = document["file_id"]
+        r_path = requests.get(f"https://api.telegram.org/bot{Config.TELEGRAM_TOKEN}/getFile?file_id={file_id}")
+        file_path = r_path.json()["result"]["file_path"]
+        r_content = requests.get(f"https://api.telegram.org/file/bot{Config.TELEGRAM_TOKEN}/{file_path}")
+        content_utf8 = r_content.content.decode('utf-8')
+        data_import = json.loads(content_utf8)
+        
+        if not isinstance(data_import, list):
+            send_tg(chat_id, "🚫 Erro: O JSON deve ser uma lista.")
+            return
+
+        # 2. Validar Itens
+        valid_items = []
+        for item in data_import:
+            if "materia" not in item or "data" not in item: continue
+            
+            # Sanitiza o item para inserção futura
+            new_item = item.copy()
+            if "_id" in new_item: del new_item["_id"]
+            new_item["user_id"] = chat_id
+            new_item["origin"] = "import_json"
+            if "tipo" not in new_item: new_item["tipo"] = "Geral"
+            if "prioridade" not in new_item: new_item["prioridade"] = "low"
+            if "observacoes" not in new_item: new_item["observacoes"] = "" # Garante campo vazio se não tiver
+            
+            valid_items.append(new_item)
+
+        if not valid_items:
+            send_tg(chat_id, "🚫 Nenhum item válido encontrado.")
+            clear_state(chat_id)
+            return
+
+        # 3. Salva TEMPORARIAMENTE no estado (MongoDB) para decisão do usuário
+        # (Como são poucos itens, cabe tranquilo no documento do Mongo)
+        set_state(chat_id, "import_confirm", "wait_decision", temp_data={"items": valid_items})
+
+        # 4. Pergunta ao Usuário
+        msg = (
+            f"📦 **Arquivo Analisado!**\n"
+            f"Encontrei {len(valid_items)} eventos válidos.\n\n"
+            "Como deseja prosseguir?"
+        )
+        
+        kb = {"inline_keyboard": [
+            [{"text": "🔥 SUBSTITUIR TUDO (Apagar atual)", "callback_data": "import_do:replace"}],
+            [{"text": "➕ MESCLAR (Ignorar duplicados)", "callback_data": "import_do:merge"}],
+            [{"text": "❌ Cancelar", "callback_data": "menu"}]
+        ]}
+        
+        send_tg(chat_id, msg, kb)
+
+    except Exception as e:
+        print(f"Erro Import: {e}")
+        send_tg(chat_id, "❌ Erro crítico ao processar o arquivo.")
+        clear_state(chat_id)
+        
 # =========================================
 #       5. INTERFACE (CALLBACKS)
 # =========================================
@@ -1128,6 +1324,84 @@ def processar_botao(chat_id, data, msg_id):
             f"`{new_link}`"
         )
         send_tg(chat_id, msg)
+        
+    elif data == "do_unlink_confirm":
+        success, msg = unlink_account(chat_id)
+        # Remove os botões da mensagem anterior para ficar limpo
+        delete_msg(chat_id, msg_id) 
+        send_tg(chat_id, msg)
+        # Volta pro menu principal
+        listar_agenda(chat_id)
+
+    elif data.startswith("import_do:"):
+        action = data.split(":")[1]
+        state = get_state(chat_id)
+        
+        # Segurança: Verifica se tem dados salvos no estado
+        if not state or "items" not in state.get("temp_data", {}):
+            send_tg(chat_id, "⚠️ Sessão expirada. Envie o arquivo novamente via `/import`.")
+            return
+
+        items_to_import = state["temp_data"]["items"]
+        
+        if action == "replace":
+            # 1. MODO SUBSTITUIR: Apaga tudo e insere
+            db.provas.delete_many({"user_id": chat_id})
+            db.provas.insert_many(items_to_import)
+            
+            # Atualiza categorias
+            db.user_settings.update_one({"user_id": chat_id}, {"$set": {"custom_cats": []}}) # Reseta cats antigas
+            for it in items_to_import:
+                 db.user_settings.update_one({"user_id": chat_id}, {"$addToSet": {"custom_cats": it["tipo"]}}, upsert=True)
+
+            send_tg(chat_id, f"✅ **Sucesso!**\nSua agenda foi totalmente substituída por {len(items_to_import)} novos eventos.", msg_id=msg_id)
+
+        elif action == "merge":
+            # 2. MODO MESCLAR: Verifica duplicidade INTELIGENTE (Tipo + Materia + Data + OBS)
+            
+            # Busca eventos existentes
+            existing = db.provas.find({"user_id": chat_id})
+            existing_sigs = set()
+            
+            for doc in existing:
+                # Assinatura Única: Inclui OBSERVAÇÕES agora!
+                sig = (
+                    str(doc.get("tipo", "")).strip().lower(),
+                    str(doc.get("materia", "")).strip().lower(),
+                    str(doc.get("data", "")).strip(),
+                    str(doc.get("observacoes", "")).strip().lower() # <--- Correção aqui
+                )
+                existing_sigs.add(sig)
+            
+            final_list = []
+            duplicates = 0
+            
+            for item in items_to_import:
+                # Cria assinatura do item novo
+                item_sig = (
+                    str(item["tipo"]).strip().lower(),
+                    str(item["materia"]).strip().lower(),
+                    str(item["data"]).strip(),
+                    str(item["observacoes"]).strip().lower()
+                )
+                
+                if item_sig in existing_sigs:
+                    duplicates += 1
+                else:
+                    final_list.append(item)
+                    existing_sigs.add(item_sig) # Evita duplicação interna no próprio JSON
+
+            if final_list:
+                db.provas.insert_many(final_list)
+                # Atualiza cats
+                for it in final_list:
+                     db.user_settings.update_one({"user_id": chat_id}, {"$addToSet": {"custom_cats": it["tipo"]}}, upsert=True)
+
+            send_tg(chat_id, f"✅ **Mesclagem Concluída!**\n📥 {len(final_list)} novos adicionados.\n♻️ {duplicates} já existiam (ignorados).", msg_id=msg_id)
+
+        # Limpa o estado e mostra a agenda
+        clear_state(chat_id)
+        listar_agenda(chat_id)
 
 def rabbit_callback(ch, method, properties, body):
     try:
@@ -1164,18 +1438,30 @@ def rabbit_callback(ch, method, properties, body):
         # ------------------------------
 
         raw = msg.get("raw_update", {})
+        # 1. Trata Botões
         if "callback_query" in raw:
             cb = raw["callback_query"]
             answer_callback(cb["id"])
             processar_botao(cb["message"]["chat"]["id"], cb["data"], cb["message"]["message_id"])
-        elif "message" in raw and "text" in raw["message"]:
+        
+        # 2. Trata Mensagens
+        elif "message" in raw:
             m = raw["message"]
-            processar_texto(m["chat"]["id"], m["text"], m["message_id"])
+            chat_id = m["chat"]["id"]
+            msg_id = m["message_id"]
+
+            # >>>> MUDANÇA AQUI: Verifica se é Documento <<<<
+            if "document" in m:
+                caption = m.get("caption", "")
+                processar_documento(chat_id, m["document"], caption, msg_id)
+            
+            # >>>> Verifica se é Texto <<<<
+            elif "text" in m:
+                processar_texto(chat_id, m["text"], msg_id)
         
         ch.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as e:
-        print(f"❌ Erro: {e}")
-        # Sempre dar ACK para não travar a fila, mesmo com erro
+        print(f"❌ Erro Worker: {e}")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
 while True:

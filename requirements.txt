@@ -7,3 +7,4 @@ prometheus-fastapi-instrumentator
 prometheus-client
 boto3
 python-multipart
+discord.py

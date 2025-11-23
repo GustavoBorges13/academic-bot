@@ -14,6 +14,8 @@ class Config:
 
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     TG_WEBHOOK_SECRET = os.getenv("TG_WEBHOOK_SECRET")
+    
+    DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
     # chave para bypass de tempo
     ADMIN_KEY = os.getenv("ADMIN_KEY")

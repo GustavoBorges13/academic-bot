@@ -150,11 +150,12 @@ services:
     networks:
       - academic_net
 
-  discord_bot:
+  discord:
     build:
       context: .
       dockerfile: src/Dockerfile
     container_name: academic_discord
+    # Comando para rodar o arquivo novo
     command: python -u -m src.discord_bot
     restart: always
     env_file: .env
