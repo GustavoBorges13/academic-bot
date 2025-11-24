@@ -226,12 +226,6 @@ Para testes rápidos (ignorando o limite mínimo de 1h), use a chave de admin co
 
 ---
 
-Perfeito! Essa funcionalidade é um dos grandes diferenciais do seu bot (transformá-lo em uma **API Headless** para o usuário).
-
-Aqui está a seção dedicada para **API & Exportação**, seguindo o mesmo padrão visual profissional. Adicione isso **antes** da seção "📄 Licença" no seu `README.md`.
-
----
-
 ## 🔗 API & Integrações Externas (`export`)
 
 O comando `/export` não serve apenas para backup. Ele transforma seu bot em um **Servidor de API Pessoal**, permitindo integrar sua agenda acadêmica com Notion, Scriptable (iOS Widget), Home Assistant ou qualquer outra aplicação.
